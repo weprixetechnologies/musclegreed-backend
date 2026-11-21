@@ -36,6 +36,10 @@ const allowedOrigins = [
   'http://localhost:3001',
   'http://127.0.0.1:3001',
   'http://localhost:3001',
+  'http://localhost:6622',
+  'http://localhost:6623',
+  'https://musclegreed.weprixe.in',
+  'https://adminmuscle.weprixe.in',
 ];
 
 app.use(
