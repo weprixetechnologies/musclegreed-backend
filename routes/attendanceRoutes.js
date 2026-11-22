@@ -8,6 +8,7 @@ const {
   markAttendance,
   getAttendanceLogs,
   getMyAttendanceStatus,
+  getMemberAttendanceSheet,
 } = require('../controllers/attendanceController');
 const {
   getStaffList,
@@ -37,10 +38,14 @@ router.get('/attendance/qr-settings', getQRSettings);
 router.post('/attendance/punch', markAttendance);
 
 // ================= PROTECTED STAFF ATTENDANCE ENDPOINTS =================
-// 3. Current logged in staff member's punch status today
-router.get('/attendance/my-status', adminAuth, getMyAttendanceStatus);
+// 3. Current logged in member or staff member's punch status today
+router.get('/attendance/my-status', getMyAttendanceStatus);
 
-// 4. Staff Attendance Logs Report (Superadmin, Admin, Receptionist)
+// 4. Member Attendance Sheet (Superadmin, Admin, Receptionist)
+router.get('/attendance/members', adminAuth, getMemberAttendanceSheet);
+router.get('/admin/attendance/members', adminAuth, getMemberAttendanceSheet);
+
+// 5. Staff Attendance Logs Report (Superadmin, Admin, Receptionist)
 router.get('/attendance/logs', adminAuth, requireRoles('superadmin', 'admin', 'receptionist'), getAttendanceLogs);
 
 // ================= ADMIN / RECEPTIONIST QR & GEOFENCE CONTROLS =================

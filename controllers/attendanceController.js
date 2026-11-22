@@ -3,8 +3,9 @@ const QRCode = require('qrcode');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { JWT_SECRET } = require('../middleware/memberAuth');
 
-const FRONTEND_APP_URL = process.env.FRONTEND_APP_URL || 'http://localhost:3000';
+const FRONTEND_APP_URL = process.env.FRONTEND_APP_URL || 'http://localhost:3001';
 
 // Helper: Haversine distance in meters
 function getHaversineDistance(lat1, lon1, lat2, lon2) {
@@ -181,62 +182,104 @@ async function updateGeofence(req, res) {
   }
 }
 
-// 4. POST Mark Attendance (Scan QR Punch IN / OUT)
+// 4. POST Mark Attendance (Scan QR Punch IN / OUT for Members & Staff)
 async function markAttendance(req, res) {
   try {
-    const { token, latitude, longitude, email, password } = req.body;
+    const { token, latitude, longitude, email, password, phone } = req.body;
 
     if (!token) {
       return res.status(400).json({ success: false, message: 'Attendance QR token is required.' });
     }
 
-    // 1. Authenticate Staff Member (either via token header or email/password)
+    // 1. Identify User (Athlete Member or Staff)
+    let memberUser = null;
     let staffUser = null;
 
-    if (req.admin) {
-      staffUser = req.admin;
-    } else if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+      const authToken = req.headers.authorization.split(' ')[1];
+      // Try Member token first
       try {
-        const authToken = req.headers.authorization.split(' ')[1];
-        staffUser = jwt.verify(authToken, process.env.JWT_ACCESS_SECRET);
-      } catch (e) {
-        // Token invalid, check body credentials
+        const decodedMember = jwt.verify(authToken, JWT_SECRET);
+        if (decodedMember && decodedMember.id) {
+          memberUser = decodedMember;
+        }
+      } catch (e) {}
+
+      // If not a member, try Staff token
+      if (!memberUser) {
+        try {
+          const decodedAdmin = jwt.verify(authToken, process.env.JWT_ACCESS_SECRET);
+          if (decodedAdmin && decodedAdmin.id) {
+            staffUser = decodedAdmin;
+          }
+        } catch (e) {}
       }
     }
 
-    if (!staffUser && email && password) {
-      const [admins] = await pool.query('SELECT * FROM admins WHERE email = ?', [email.trim()]);
-      if (admins.length > 0) {
-        const match = await bcrypt.compare(password, admins[0].password);
-        if (match) {
-          staffUser = {
-            id: admins[0].id,
-            name: admins[0].name,
-            email: admins[0].email,
-            role: admins[0].role,
-          };
+    // If still not authenticated, check credentials in body
+    if (!memberUser && !staffUser) {
+      // Check phone/password for members
+      if (phone && password) {
+        const cleanPhone = phone.trim().replace(/\s+/g, '');
+        const [users] = await pool.query('SELECT * FROM users WHERE phone = ?', [cleanPhone]);
+        if (users.length > 0) {
+          const match = await bcrypt.compare(password, users[0].password);
+          if (match) {
+            memberUser = {
+              id: users[0].id,
+              name: users[0].name,
+              phone: users[0].phone,
+              status: users[0].status,
+            };
+          }
+        }
+      }
+
+      // Check email/password for staff
+      if (!memberUser && email && password) {
+        const [admins] = await pool.query('SELECT * FROM admins WHERE email = ?', [email.trim()]);
+        if (admins.length > 0) {
+          const match = await bcrypt.compare(password, admins[0].password);
+          if (match) {
+            staffUser = {
+              id: admins[0].id,
+              name: admins[0].name,
+              email: admins[0].email,
+              role: admins[0].role,
+            };
+          }
         }
       }
     }
 
-    if (!staffUser) {
+    if (!memberUser && !staffUser) {
       return res.status(401).json({
         success: false,
         requiresLogin: true,
-        message: 'Staff authentication required. Please log in with your Trainer / Receptionist account to mark attendance.',
+        message: 'Authentication required. Please sign in to mark attendance.',
       });
     }
 
-    // Verify role
-    const allowedRoles = ['trainer', 'receptionist', 'admin', 'superadmin'];
-    if (!allowedRoles.includes(staffUser.role?.toLowerCase())) {
+    // If Member: check banned status
+    if (memberUser && memberUser.status === 'banned') {
       return res.status(403).json({
         success: false,
-        message: `Role "${staffUser.role}" is not authorized for staff attendance tracking.`,
+        message: 'Your athlete account has been suspended by gym management.',
       });
     }
 
-    // 2. Validate QR Token against active DB scanner
+    // If Staff: verify staff role
+    if (staffUser) {
+      const allowedRoles = ['trainer', 'receptionist', 'admin', 'superadmin'];
+      if (!allowedRoles.includes(staffUser.role?.toLowerCase())) {
+        return res.status(403).json({
+          success: false,
+          message: `Role "${staffUser.role}" is not authorized for staff attendance tracking.`,
+        });
+      }
+    }
+
+    // 2. Validate QR Token against active DB settings
     const [settingsRows] = await pool.query('SELECT * FROM attendance_qr_settings WHERE id = 1');
     if (settingsRows.length === 0) {
       return res.status(400).json({ success: false, message: 'Attendance system is not initialized.' });
@@ -247,7 +290,7 @@ async function markAttendance(req, res) {
       return res.status(400).json({
         success: false,
         invalidToken: true,
-        message: 'Invalid or invalidated attendance scanner QR code. The gym admin may have regenerated the poster. Please scan the latest official QR poster.',
+        message: 'Invalid or invalidated attendance scanner QR code. Please scan the official gym poster.',
       });
     }
 
@@ -281,7 +324,70 @@ async function markAttendance(req, res) {
       }
     }
 
-    // 4. Determine Punch Type (IN or OUT toggle)
+    // ================= BRANCH A: MEMBER ATTENDANCE PUNCH =================
+    if (memberUser) {
+      // Find active membership pass if any
+      const [mRows] = await pool.query(
+        "SELECT membership_id, plan_title, status FROM memberships WHERE user_id = ? ORDER BY (status = 'active') DESC, created_at DESC LIMIT 1",
+        [memberUser.id]
+      );
+      const membershipId = mRows.length > 0 ? mRows[0].membership_id : null;
+
+      // Determine Punch Type (IN or OUT toggle)
+      const [lastPunchRows] = await pool.query(`
+        SELECT * FROM member_attendance_logs
+        WHERE user_id = ? AND date = CURDATE()
+        ORDER BY punch_time DESC
+        LIMIT 1
+      `, [memberUser.id]);
+
+      let punchType = (lastPunchRows.length > 0 && lastPunchRows[0].punch_type === 'IN') ? 'OUT' : 'IN';
+
+      // Insert Attendance Punch
+      await pool.query(`
+        INSERT INTO member_attendance_logs (
+          user_id, member_name, member_phone, membership_id, punch_type, punch_time, date, latitude, longitude, distance_meters, qr_token
+        ) VALUES (?, ?, ?, ?, ?, NOW(), CURDATE(), ?, ?, ?, ?)
+      `, [
+        memberUser.id,
+        memberUser.name || 'Member Athlete',
+        memberUser.phone || '',
+        membershipId,
+        punchType,
+        latitude || null,
+        longitude || null,
+        distanceMeters !== null ? Math.round(distanceMeters) : null,
+        token,
+      ]);
+
+      // Fetch all punches for today to compute total workout hours
+      const [allTodayPunches] = await pool.query(`
+        SELECT 
+          id, punch_type, DATE_FORMAT(punch_time, '%h:%i %p') as time_formatted,
+          punch_time, distance_meters
+        FROM member_attendance_logs
+        WHERE user_id = ? AND date = CURDATE()
+        ORDER BY punch_time ASC
+      `, [memberUser.id]);
+
+      const { formatted: totalHoursFormatted } = calculateWorkingHours(allTodayPunches);
+
+      return res.status(200).json({
+        success: true,
+        isMember: true,
+        punchType,
+        punchTimeFormatted: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true }),
+        memberName: memberUser.name,
+        staffName: memberUser.name,
+        membershipId,
+        distanceMeters: distanceMeters !== null ? Math.round(distanceMeters) : null,
+        totalWorkingHoursToday: totalHoursFormatted,
+        todayPunches: allTodayPunches,
+        message: `Successfully recorded check-${punchType.toLowerCase()}! Workout session duration today: ${totalHoursFormatted}.`,
+      });
+    }
+
+    // ================= BRANCH B: STAFF ATTENDANCE PUNCH =================
     const [lastPunchRows] = await pool.query(`
       SELECT * FROM staff_attendance_logs
       WHERE staff_id = ? AND date = CURDATE()
@@ -289,14 +395,8 @@ async function markAttendance(req, res) {
       LIMIT 1
     `, [staffUser.id]);
 
-    let punchType = 'IN';
-    if (lastPunchRows.length > 0 && lastPunchRows[0].punch_type === 'IN') {
-      punchType = 'OUT';
-    } else {
-      punchType = 'IN';
-    }
+    let punchType = (lastPunchRows.length > 0 && lastPunchRows[0].punch_type === 'IN') ? 'OUT' : 'IN';
 
-    // 5. Insert Attendance Punch
     await pool.query(`
       INSERT INTO staff_attendance_logs (
         staff_id, staff_name, staff_role, punch_type, punch_time, date, latitude, longitude, distance_meters, qr_token
@@ -312,7 +412,6 @@ async function markAttendance(req, res) {
       token,
     ]);
 
-    // 6. Fetch all punches for today to compute total hours
     const [allTodayPunches] = await pool.query(`
       SELECT 
         id, punch_type, DATE_FORMAT(punch_time, '%h:%i %p') as time_formatted,
@@ -326,6 +425,7 @@ async function markAttendance(req, res) {
 
     return res.status(200).json({
       success: true,
+      isStaff: true,
       punchType,
       punchTimeFormatted: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true }),
       staffName: staffUser.name,
@@ -416,22 +516,100 @@ async function getAttendanceLogs(req, res) {
   }
 }
 
-// 6. GET My Attendance Status (For Current Staff Member)
+// 6. GET Personal Attendance Status & Logs (For Members & Staff)
 async function getMyAttendanceStatus(req, res) {
   try {
-    const staffId = req.admin?.id;
-    if (!staffId) {
+    let memberUser = null;
+    let staffUser = null;
+
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+      const authToken = req.headers.authorization.split(' ')[1];
+      try {
+        const decodedMember = jwt.verify(authToken, JWT_SECRET);
+        if (decodedMember && decodedMember.id) {
+          memberUser = decodedMember;
+        }
+      } catch (e) {}
+
+      if (!memberUser) {
+        try {
+          const decodedAdmin = jwt.verify(authToken, process.env.JWT_ACCESS_SECRET);
+          if (decodedAdmin && decodedAdmin.id) {
+            staffUser = decodedAdmin;
+          }
+        } catch (e) {}
+      }
+    }
+
+    if (!memberUser && !staffUser) {
       return res.status(401).json({ success: false, message: 'Authentication required.' });
     }
 
+    const { date } = req.query;
+    let targetDate = date ? date.trim() : null;
+    let dateCondition = targetDate ? 'date = ?' : 'date = CURDATE()';
+
+    // Member attendance logs
+    if (memberUser) {
+      const params = targetDate ? [memberUser.id, targetDate] : [memberUser.id];
+      const [todayPunches] = await pool.query(`
+        SELECT 
+          id, punch_type, punch_time, DATE_FORMAT(punch_time, '%h:%i %p') as time_formatted,
+          DATE_FORMAT(date, '%Y-%m-%d') as date_formatted,
+          distance_meters
+        FROM member_attendance_logs
+        WHERE user_id = ? AND ${dateCondition}
+        ORDER BY punch_time ASC
+      `, params);
+
+      const { formatted, isCurrentlyIn } = calculateWorkingHours(todayPunches);
+
+      let status = 'NOT CHECKED IN';
+      if (todayPunches.length > 0) {
+        status = isCurrentlyIn ? 'CHECKED IN' : 'CHECKED OUT';
+      }
+
+      const [recentLogs] = await pool.query(`
+        SELECT 
+          id, punch_type, punch_time, 
+          DATE_FORMAT(punch_time, '%h:%i %p') as time_formatted,
+          DATE_FORMAT(date, '%Y-%m-%d') as date_formatted,
+          distance_meters
+        FROM member_attendance_logs
+        WHERE user_id = ?
+        ORDER BY punch_time DESC
+        LIMIT 30
+      `, [memberUser.id]);
+
+      return res.status(200).json({
+        success: true,
+        isMember: true,
+        data: {
+          status,
+          isCurrentlyIn,
+          totalWorkingHoursToday: formatted,
+          todayPunches,
+          recentLogs,
+          member: {
+            id: memberUser.id,
+            name: memberUser.name,
+            phone: memberUser.phone,
+          },
+        },
+      });
+    }
+
+    // Staff attendance logs
+    const params = targetDate ? [staffUser.id, targetDate] : [staffUser.id];
     const [todayPunches] = await pool.query(`
       SELECT 
         id, punch_type, punch_time, DATE_FORMAT(punch_time, '%h:%i %p') as time_formatted,
+        DATE_FORMAT(date, '%Y-%m-%d') as date_formatted,
         distance_meters
       FROM staff_attendance_logs
-      WHERE staff_id = ? AND date = CURDATE()
+      WHERE staff_id = ? AND ${dateCondition}
       ORDER BY punch_time ASC
-    `, [staffId]);
+    `, params);
 
     const { formatted, isCurrentlyIn } = calculateWorkingHours(todayPunches);
 
@@ -440,18 +618,124 @@ async function getMyAttendanceStatus(req, res) {
       status = isCurrentlyIn ? 'CHECKED IN' : 'CHECKED OUT';
     }
 
+    const [recentLogs] = await pool.query(`
+      SELECT 
+        id, punch_type, punch_time, 
+        DATE_FORMAT(punch_time, '%h:%i %p') as time_formatted,
+        DATE_FORMAT(date, '%Y-%m-%d') as date_formatted,
+        distance_meters
+      FROM staff_attendance_logs
+      WHERE staff_id = ?
+      ORDER BY punch_time DESC
+      LIMIT 30
+    `, [staffUser.id]);
+
     return res.status(200).json({
       success: true,
+      isStaff: true,
       data: {
         status,
         isCurrentlyIn,
         totalWorkingHoursToday: formatted,
         todayPunches,
+        recentLogs,
+        staff: {
+          id: staffUser.id,
+          name: staffUser.name,
+          email: staffUser.email,
+          role: staffUser.role,
+        },
       },
     });
   } catch (error) {
-    console.error('Error fetching my attendance status:', error);
+    console.error('Error fetching attendance status:', error);
     return res.status(500).json({ success: false, message: 'Failed to fetch personal attendance.' });
+  }
+}
+
+// 7. GET Member Attendance Sheet for Admin Dashboard
+async function getMemberAttendanceSheet(req, res) {
+  try {
+    const { date, search } = req.query;
+
+    let targetDate = date ? date.trim() : null;
+    if (!targetDate) {
+      const [todayRow] = await pool.query("SELECT DATE_FORMAT(CURDATE(), '%Y-%m-%d') as today");
+      targetDate = todayRow[0].today;
+    }
+
+    // Query member_attendance_logs for targetDate
+    const [punches] = await pool.query(`
+      SELECT 
+        mal.id,
+        mal.user_id,
+        mal.member_name,
+        mal.member_phone,
+        mal.membership_id,
+        mal.punch_type,
+        mal.punch_time,
+        DATE_FORMAT(mal.punch_time, '%h:%i %p') as time_formatted,
+        DATE_FORMAT(mal.date, '%Y-%m-%d') as date_formatted,
+        mal.distance_meters,
+        m.plan_title,
+        m.service_title,
+        m.status as membership_status
+      FROM member_attendance_logs mal
+      LEFT JOIN memberships m ON m.membership_id = mal.membership_id
+      WHERE mal.date = ?
+      ORDER BY mal.punch_time ASC
+    `, [targetDate]);
+
+    // Group punches by user_id
+    const punchesByUser = {};
+    for (const p of punches) {
+      if (!punchesByUser[p.user_id]) punchesByUser[p.user_id] = [];
+      punchesByUser[p.user_id].push(p);
+    }
+
+    // Transform into attendance records
+    const attendanceRecords = Object.keys(punchesByUser).map((userId) => {
+      const userPunches = punchesByUser[userId];
+      const { formatted, isCurrentlyIn } = calculateWorkingHours(userPunches);
+
+      const firstPunch = userPunches[0];
+      const firstIn = userPunches.find((p) => p.punch_type === 'IN');
+      const lastOut = [...userPunches].reverse().find((p) => p.punch_type === 'OUT');
+      const latestPunch = userPunches[userPunches.length - 1];
+
+      return {
+        userId: Number(userId),
+        name: firstPunch.member_name,
+        phone: firstPunch.member_phone,
+        membershipId: firstPunch.membership_id || 'N/A',
+        planTitle: firstPunch.plan_title || 'General Athlete',
+        serviceTitle: firstPunch.service_title || 'Gym Facility',
+        membershipStatus: firstPunch.membership_status || 'active',
+        status: isCurrentlyIn ? 'CHECKED IN' : 'CHECKED OUT',
+        isCurrentlyIn,
+        firstInTime: firstIn ? firstIn.time_formatted : 'N/A',
+        lastOutTime: lastOut && !isCurrentlyIn ? lastOut.time_formatted : (isCurrentlyIn ? 'Active Now' : 'N/A'),
+        totalWorkoutDuration: formatted,
+        totalPunchesCount: userPunches.length,
+        distanceMeters: latestPunch?.distance_meters,
+        punches: userPunches,
+      };
+    });
+
+    const currentlyInCount = attendanceRecords.filter((r) => r.isCurrentlyIn).length;
+    const completedCount = attendanceRecords.filter((r) => !r.isCurrentlyIn).length;
+
+    return res.status(200).json({
+      success: true,
+      date: targetDate,
+      totalCount: attendanceRecords.length,
+      currentlyInCount,
+      completedCount,
+      data: attendanceRecords,
+    });
+  } catch (error) {
+    console.error('Error fetching member attendance sheet:', error);
+    return res.status(500).json({ success: false, message: 'Failed to retrieve member attendance sheet.' });
   }
 }
 
@@ -462,4 +746,5 @@ module.exports = {
   markAttendance,
   getAttendanceLogs,
   getMyAttendanceStatus,
+  getMemberAttendanceSheet,
 };

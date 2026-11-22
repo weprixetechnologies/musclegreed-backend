@@ -146,6 +146,28 @@ async function initDb() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
+    // 8. Member Attendance Logs table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS member_attendance_logs (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        member_name VARCHAR(100) NOT NULL,
+        member_phone VARCHAR(50) NOT NULL,
+        membership_id VARCHAR(50) NULL,
+        punch_type ENUM('IN', 'OUT') NOT NULL,
+        punch_time DATETIME NOT NULL,
+        date DATE NOT NULL,
+        latitude DECIMAL(10, 8) NULL,
+        longitude DECIMAL(11, 8) NULL,
+        distance_meters FLOAT NULL,
+        qr_token VARCHAR(100) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_member_date (user_id, date),
+        INDEX idx_date (date),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
     console.log('Database initialization for subscription flow & attendance finished successfully.');
   } catch (err) {
     console.error('Database initialization error:', err);
