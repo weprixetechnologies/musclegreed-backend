@@ -2,22 +2,36 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 
-const COOKIE_OPTIONS = {
-  httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: 'lax',
-  maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-  path: '/',
-};
+function getCookieOptions(req) {
+  const isHttps =
+    Boolean(req?.secure) ||
+    req?.headers?.['x-forwarded-proto'] === 'https' ||
+    process.env.NODE_ENV === 'production';
 
-const CLEAR_COOKIE_OPTIONS = {
-  httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: 'lax',
-  path: '/',
-  expires: new Date(0),
-  maxAge: 0,
-};
+  return {
+    httpOnly: true,
+    secure: Boolean(isHttps),
+    sameSite: isHttps ? 'none' : 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    path: '/',
+  };
+}
+
+function getClearCookieOptions(req) {
+  const isHttps =
+    Boolean(req?.secure) ||
+    req?.headers?.['x-forwarded-proto'] === 'https' ||
+    process.env.NODE_ENV === 'production';
+
+  return {
+    httpOnly: true,
+    secure: Boolean(isHttps),
+    sameSite: isHttps ? 'none' : 'lax',
+    path: '/',
+    expires: new Date(0),
+    maxAge: 0,
+  };
+}
 
 function generateAccessToken(admin) {
   return jwt.sign(
@@ -82,11 +96,12 @@ async function login(req, res) {
     );
 
     // Set HttpOnly cookie for refresh token
-    res.cookie('refreshToken', refreshToken, COOKIE_OPTIONS);
+    res.cookie('refreshToken', refreshToken, getCookieOptions(req));
 
     return res.status(200).json({
       success: true,
       accessToken,
+      refreshToken,
       admin: {
         id: admin.id,
         name: admin.name,
@@ -106,7 +121,7 @@ async function login(req, res) {
 // 2. Refresh Token
 async function refreshToken(req, res) {
   try {
-    const token = req.cookies.refreshToken;
+    const token = req.cookies?.refreshToken || req.body?.refreshToken || req.headers?.['x-refresh-token'];
 
     if (!token) {
       return res.status(401).json({
@@ -119,7 +134,7 @@ async function refreshToken(req, res) {
     try {
       decoded = jwt.verify(token, process.env.JWT_REFRESH_SECRET);
     } catch (err) {
-      res.clearCookie('refreshToken', CLEAR_COOKIE_OPTIONS);
+      res.clearCookie('refreshToken', getClearCookieOptions(req));
       return res.status(401).json({
         success: false,
         message: 'Invalid or expired refresh token',
@@ -133,7 +148,7 @@ async function refreshToken(req, res) {
     );
 
     if (rows.length === 0) {
-      res.clearCookie('refreshToken', CLEAR_COOKIE_OPTIONS);
+      res.clearCookie('refreshToken', getClearCookieOptions(req));
       return res.status(401).json({
         success: false,
         message: 'Refresh token revoked or expired',
@@ -155,7 +170,7 @@ async function refreshToken(req, res) {
     // Fetch fresh admin details
     const [admins] = await pool.query('SELECT id, name, email, role FROM admins WHERE id = ?', [decoded.id]);
     if (admins.length === 0) {
-      res.clearCookie('refreshToken', CLEAR_COOKIE_OPTIONS);
+      res.clearCookie('refreshToken', getClearCookieOptions(req));
       return res.status(401).json({
         success: false,
         message: 'Admin account not found',
@@ -173,11 +188,12 @@ async function refreshToken(req, res) {
     );
 
     // Set new cookie
-    res.cookie('refreshToken', newRefreshToken, COOKIE_OPTIONS);
+    res.cookie('refreshToken', newRefreshToken, getCookieOptions(req));
 
     return res.status(200).json({
       success: true,
       accessToken: newAccessToken,
+      refreshToken: newRefreshToken,
       admin: {
         id: admin.id,
         name: admin.name,
@@ -197,13 +213,13 @@ async function refreshToken(req, res) {
 // 3. Admin Logout
 async function logout(req, res) {
   try {
-    const token = req.cookies.refreshToken;
+    const token = req.cookies?.refreshToken || req.body?.refreshToken || req.headers?.['x-refresh-token'];
 
     if (token) {
       await pool.query('DELETE FROM refresh_tokens WHERE token = ?', [token]);
     }
 
-    res.clearCookie('refreshToken', CLEAR_COOKIE_OPTIONS);
+    res.clearCookie('refreshToken', getClearCookieOptions(req));
 
     return res.status(200).json({
       success: true,
@@ -211,7 +227,7 @@ async function logout(req, res) {
     });
   } catch (error) {
     console.error('Logout error:', error);
-    res.clearCookie('refreshToken', CLEAR_COOKIE_OPTIONS);
+    res.clearCookie('refreshToken', getClearCookieOptions(req));
     return res.status(200).json({
       success: true,
       message: 'Logged out successfully',

@@ -41,7 +41,7 @@ function requestLogger(req, res, next) {
         if (sanitizedBody.password) sanitizedBody.password = '***REDACTED***';
         console.log(`   └─ [Payload]: ${JSON.stringify(sanitizedBody)}`);
       }
-      if (!hasRefreshCookie && req.originalUrl?.includes('refresh-token')) {
+      if (req.method !== 'OPTIONS' && !hasRefreshCookie && req.originalUrl?.includes('refresh-token')) {
         console.log(`   └─ [Notice]: refresh-token request arrived without refreshToken cookie. Raw Cookie header: "${req.headers.cookie || '(empty)'}"`);
       }
     }

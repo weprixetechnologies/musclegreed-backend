@@ -18,6 +18,9 @@ const { seedDefaultStaff } = require('./controllers/staffController');
 const app = express();
 const PORT = process.env.PORT || 5672;
 
+// Enable trust proxy for secure cookie handling and HTTPS detection behind Nginx / Cloudflare
+app.set('trust proxy', 1);
+
 // Middleware
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
