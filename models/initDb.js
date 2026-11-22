@@ -165,8 +165,14 @@ async function initDb() {
         INDEX idx_member_date (user_id, date),
         INDEX idx_date (date),
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
+
+    // Ensure collations match across all existing tables
+    await pool.query(`
+      ALTER TABLE member_attendance_logs 
+      CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    `).catch(() => {});
 
     console.log('Database initialization for subscription flow & attendance finished successfully.');
   } catch (err) {

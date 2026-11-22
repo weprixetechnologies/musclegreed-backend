@@ -681,7 +681,7 @@ async function getMemberAttendanceSheet(req, res) {
         m.service_title,
         m.status as membership_status
       FROM member_attendance_logs mal
-      LEFT JOIN memberships m ON m.membership_id = mal.membership_id
+      LEFT JOIN memberships m ON m.membership_id = mal.membership_id COLLATE utf8mb4_unicode_ci
       WHERE mal.date = ?
       ORDER BY mal.punch_time ASC
     `, [targetDate]);
